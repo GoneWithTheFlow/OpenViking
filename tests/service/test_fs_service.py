@@ -15,12 +15,16 @@ from openviking_cli.session.user_id import UserIdentifier
 
 
 class _FakeVikingFS:
-    def __init__(self, *, rm_error=None, events=None):
+    def __init__(self, *, rm_error=None, events=None, parent_exists=True):
         self.rm_calls = []
         self.mv_calls = []
         self.cp_calls = []
         self.rm_error = rm_error
         self.events = events
+        self.parent_exists = parent_exists
+
+    async def exists(self, uri, ctx=None):
+        return self.parent_exists
 
     async def rm(self, uri, recursive=False, ctx=None):
         self.rm_calls.append({"uri": uri, "recursive": recursive, "ctx": ctx})
@@ -54,20 +58,27 @@ class _FakeVikingFS:
 
 
 @pytest.mark.asyncio
-async def test_stat_forwards_skip_count_without_changing_default(request_context):
+async def test_stat_forwards_optional_fields_without_changing_defaults(request_context):
     viking_fs = SimpleNamespace(stat=AsyncMock(return_value={"isDir": True}))
     service = FSService(viking_fs=viking_fs)
 
-    await service.stat("viking://resources", request_context, skip_count=True)
+    await service.stat(
+        "viking://resources",
+        request_context,
+        skip_count=True,
+        include_lock_status=True,
+    )
     await service.stat("viking://resources", request_context)
 
     assert viking_fs.stat.await_args_list[0].kwargs == {
         "ctx": request_context,
         "skip_count": True,
+        "include_lock_status": True,
     }
     assert viking_fs.stat.await_args_list[1].kwargs == {
         "ctx": request_context,
         "skip_count": False,
+        "include_lock_status": False,
     }
 
 
@@ -449,7 +460,14 @@ async def test_glob_filters_and_projects_tags_before_applying_node_limit(request
         "count": 1,
     }
     assert viking_fs.glob.await_args.kwargs["extra_fields"] == []
-    assert viking_fs.glob.await_args.kwargs["node_limit"] is None
+    assert viking_fs.glob.await_args.kwargs["node_limit"] == 1
+    assert viking_fs.glob.await_args.kwargs["tag_filter"] == {
+        "op": "and",
+        "conds": [
+            {"op": "must", "field": "search_tags", "conds": ["team=search"]},
+            {"op": "must", "field": "search_tags", "conds": ["env=prod"]},
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -738,6 +756,21 @@ async def test_resource_rm_reports_failed_semantic_status_when_wait_queue_has_er
     )
 
     assert result["semantic_status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_resource_rm_skips_parent_refresh_when_parent_is_gone(request_context):
+    """Refreshing a deleted parent would lock its sidecars and recreate it."""
+    viking_fs = _FakeVikingFS(parent_exists=False)
+    service = FSService(viking_fs=viking_fs)
+    service._enqueue_delete_refresh = AsyncMock()
+
+    uri = "viking://resources/deleted/sub/a.md"
+    result = await service.rm(uri, ctx=request_context, wait=True)
+
+    assert viking_fs.rm_calls == [{"uri": uri, "recursive": False, "ctx": request_context}]
+    service._enqueue_delete_refresh.assert_not_awaited()
+    assert "semantic_root_uri" not in result
 
 
 @pytest.mark.asyncio

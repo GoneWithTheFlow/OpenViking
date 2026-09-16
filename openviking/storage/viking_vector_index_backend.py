@@ -17,6 +17,7 @@ from openviking.core.namespace import (
     visible_roots,
 )
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.storage.acl import (
     ACL_CONTEXT_FIELDS,
     ACL_MODE_FIELD,
@@ -27,7 +28,7 @@ from openviking.storage.acl import (
     acl_principals,
     is_acl_uri,
 )
-from openviking.storage.expr import And, Contains, Eq, FilterExpr, In, Or, PathScope, RawDSL
+from openviking.storage.expr import And, Eq, FilterExpr, In, Or, PathScope, RawDSL
 from openviking.storage.vector_migration import (
     rewrite_transfer_uri,
     rewrite_vector_record,
@@ -151,7 +152,9 @@ class _AsyncVectorAdapter:
         self._adapter = adapter
 
     async def call(self, method_name: str, /, *args: Any, **kwargs: Any) -> Any:
-        return await asyncio.to_thread(getattr(self._adapter, method_name), *args, **kwargs)
+        return await run_to_completion(
+            lambda: asyncio.to_thread(getattr(self._adapter, method_name), *args, **kwargs)
+        )
 
     async def run(self, func: Any, /, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(func, *args, **kwargs)
@@ -198,7 +201,6 @@ class _AsyncVectorAdapter:
                 )
 
         await asyncio.to_thread(_update)
-
 
 class _SingleAccountBackend:
     """绑定单个 account 的后端实现（内部类）"""
@@ -716,6 +718,27 @@ class _SingleAccountBackend:
         except Exception as e:
             logger.error("Error querying collection: %s", e, exc_info=True)
             return []
+
+    async def search_by_random(
+        self,
+        filter: Optional[Dict[str, Any] | FilterExpr] = None,
+        limit: int = 10,
+        offset: int = 0,
+        output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            return await self._async_adapter.call(
+                "search_by_random",
+                filter=self._with_account_filter(filter),
+                limit=limit,
+                offset=offset,
+                output_fields=output_fields,
+                advance=advance,
+            )
+        except Exception as e:
+            logger.error("Error searching collection by random: %s", e, exc_info=True)
+            raise
 
     async def search(
         self,
@@ -1332,6 +1355,26 @@ class VikingVectorIndexBackend:
             order_desc=order_desc,
         )
 
+    async def search_by_random(
+        self,
+        filter: Optional[Dict[str, Any] | FilterExpr] = None,
+        limit: int = 10,
+        offset: int = 0,
+        output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
+        *,
+        ctx: RequestContext,
+    ) -> List[Dict[str, Any]]:
+        backend = self._get_backend_for_context(ctx)
+        filter = self._merge_filters(filter, self._tenant_filter(ctx))
+        return await backend.search_by_random(
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            output_fields=output_fields,
+            advance=advance,
+        )
+
     async def search(
         self,
         query_vector: Optional[List[float]] = None,
@@ -1714,12 +1757,11 @@ class VikingVectorIndexBackend:
         scopes: List[FilterExpr] = [Eq("uri", uri)]
         if recursive:
             scopes.append(PathScope("uri", uri, depth=-1))
-        if self.mode == "volcengine":
-            parent = VikingURI(uri).parent
-            if parent is not None and parent.uri != "viking://":
-                scopes.append(PathScope("uri", parent.uri, depth=1))
-        else:
-            scopes.append(Contains("uri", uri + "#"))
+        # Chunk URIs are siblings in the path index. Scan one parent level and
+        # filter exact transfer entries below, without backend-specific operators.
+        parent = VikingURI(uri).parent
+        if parent is not None and parent.uri != "viking://":
+            scopes.append(PathScope("uri", parent.uri, depth=1))
         return And([Eq("account_id", ctx.account_id), Or(scopes)])
 
     async def _scan_uri_transfer_scope(
@@ -1737,27 +1779,10 @@ class VikingVectorIndexBackend:
         if selected_entries is not None:
             if not selected_entries:
                 return [], 0
-            filters: List[FilterExpr] = []
-            for entry in sorted(selected_entries):
-                if self.mode == "volcengine":
-                    filters.append(self._uri_transfer_filter(ctx, entry, recursive=False))
-                else:
-                    # Raw prefix filters encode URI values to the stored path format.
-                    filters.append(
-                        And(
-                            [
-                                Eq("account_id", ctx.account_id),
-                                Or(
-                                    [
-                                        Eq("uri", entry),
-                                        RawDSL(
-                                            {"op": "prefix", "field": "uri", "prefix": entry + "#"}
-                                        ),
-                                    ]
-                                ),
-                            ]
-                        )
-                    )
+            filters = [
+                self._uri_transfer_filter(ctx, entry, recursive=False)
+                for entry in sorted(selected_entries)
+            ]
             transfer_filter = filters[0] if len(filters) == 1 else Or(filters)
         else:
             transfer_filter = self._uri_transfer_filter(ctx, uri, recursive=recursive)
@@ -2277,13 +2302,15 @@ class VikingVectorIndexBackend:
                 ]
             )
 
+        controlled_modes = [AclMode.INHERIT.value, AclMode.RESTRICTED.value]
         uncontrolled_filter = And(
             [
                 RawDSL(
                     {
                         "op": "must_not",
                         "field": ACL_MODE_FIELD,
-                        "conds": [AclMode.INHERIT.value],
+                        # Exclude controlled modes so absent/null fields stay visible.
+                        "conds": controlled_modes,
                     }
                 ),
                 Or([PathScope("uri", root, depth=-1) for root in visible_roots(ctx)]),
@@ -2293,10 +2320,16 @@ class VikingVectorIndexBackend:
         shared_acl_filter = And(
             [
                 PathScope("uri", "viking://resources", depth=-1),
+                In(ACL_MODE_FIELD, controlled_modes),
                 Or(
                     [
                         In("acl_direct_grants", read_grants),
-                        In("acl_inherited_grants", read_grants),
+                        And(
+                            [
+                                Eq(ACL_MODE_FIELD, AclMode.INHERIT.value),
+                                In("acl_inherited_grants", read_grants),
+                            ]
+                        ),
                     ]
                 ),
             ]
@@ -2315,16 +2348,19 @@ class VikingVectorIndexBackend:
 
     @staticmethod
     def _merge_filters(*filters: Optional[FilterExpr]) -> Optional[FilterExpr]:
-        non_empty = [
-            f
-            for f in filters
-            if f
-            and not (
-                isinstance(f, RawDSL)
-                and f.payload.get("op") == "and"
-                and not f.payload.get("conds")
-            )
-        ]
+        non_empty: List[FilterExpr] = []
+        for item in filters:
+            if not item:
+                continue
+            if isinstance(item, dict):
+                item = RawDSL(item)
+            if (
+                isinstance(item, RawDSL)
+                and item.payload.get("op") == "and"
+                and not item.payload.get("conds")
+            ):
+                continue
+            non_empty.append(item)
         if not non_empty:
             return None
         if len(non_empty) == 1:

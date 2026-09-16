@@ -328,6 +328,8 @@ JSON 输出 - 错误：
 | `SESSION_EXPIRED` | 410 | 会话已过期 |
 | `NOT_INITIALIZED` | - | 服务或组件未初始化（需要先调用 initialize()） |
 
+文件／目录类型不符合操作要求、复制或删除目录时缺少 `recursive=true`，以及 HTTP 来源域名明确不存在，均返回 `INVALID_ARGUMENT`（400）。正常路径锁竞争（包括加密写入）返回 `CONFLICT`（409）；锁令牌损坏、锁 I/O 故障和落盘数据解密失败返回 `INTERNAL`（500）。HTTP 来源站不可用或发生临时网络故障时返回 `UNAVAILABLE`（503），抓取超时返回 `DEADLINE_EXCEEDED`（504）。
+
 ---
 
 ## API 端点总览
@@ -460,6 +462,7 @@ JSON 输出 - 错误：
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| POST | `/api/v1/compile` | 创建由 OV 托管的 Compile 任务 |
 | GET | `/api/v1/tasks/{task_id}` | 获取后台任务 |
 | POST | `/api/v1/tasks/{task_id}/cancel` | 取消后台任务 |
 | GET | `/api/v1/tasks` | 列出后台任务 |
@@ -480,6 +483,10 @@ JSON 输出 - 错误：
 | PUT | `/api/v1/admin/agent-evolution` | 更新调用方 account 的 Agent 进化状态 |
 | GET | `/api/v1/admin/accounts/{account_id}/settings` | 获取 account 生效配置 |
 | PATCH | `/api/v1/admin/accounts/{account_id}/settings` | 更新白名单内的 account 配置 |
+| GET | `/api/v1/admin/accounts/{account_id}/memory-templates` | 列出可编辑记忆模板、默认值及生效值 |
+| GET | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | 查询单个记忆模板 |
+| PUT | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | 补齐并发布单个记忆模板 |
+| DELETE | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | 删除记忆模板覆盖，恢复部署默认值 |
 | POST | `/api/v1/admin/accounts` | 创建账号及首个管理员 |
 | GET | `/api/v1/admin/accounts` | 列出账号 |
 | POST | `/api/v1/admin/migrate` | 迁移旧版身份数据 |
@@ -505,7 +512,7 @@ JSON 输出 - 错误：
 | POST | `/api/v1/privacy-configs/{category}/{target_key}` | 写入并激活新版本 |
 | POST | `/api/v1/privacy-configs/{category}/{target_key}/activate` | 激活指定版本 |
 
-### [OpenViking Assets](22-openviking-assets.md)、[WebDAV](20-webdav.md) 与 [VikingBot API](24-vikingbot.md)
+### [OpenViking Assets](22-openviking-assets.md)、[WebDAV](20-webdav.md)、[Agent Runtime API](23-agent-runtime.md) 与 [VikingBot API](24-vikingbot.md)
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -518,13 +525,14 @@ JSON 输出 - 错误：
 | DELETE | `/webdav/resources`、`/webdav/resources/{resource_path}` | 删除文件或目录 |
 | MKCOL | `/webdav/resources`、`/webdav/resources/{resource_path}` | 创建目录 |
 | MOVE | `/webdav/resources`、`/webdav/resources/{resource_path}` | 移动或重命名资源 |
+| POST | `/api/v1/compile` | 创建异步 Compile 任务 |
 | GET | `/bot/v1/health` | VikingBot 健康检查 |
 | POST | `/bot/v1/chat` | VikingBot 非流式对话 |
 | POST | `/bot/v1/chat/stream` | VikingBot 流式对话 |
 | POST | `/bot/v1/feedback` | 提交 VikingBot 回答反馈 |
-| POST | `/bot/v1/compile` | 启动 Skill 驱动的 Compile 任务 |
-| GET | `/bot/v1/compile/{task_id}` | 获取 Compile 任务状态 |
-| POST | `/bot/v1/compile/{task_id}/cancel` | 取消 Compile 任务 |
+| POST | `/bot/v1/compile` | 已停用；返回新接口迁移提示 |
+| GET | `/bot/v1/compile/{task_id}` | 已停用；返回 Task 接口迁移提示 |
+| POST | `/bot/v1/compile/{task_id}/cancel` | 已停用；返回 Task 取消接口迁移提示 |
 
 ---
 
@@ -539,4 +547,4 @@ JSON 输出 - 错误：
 | 数据生命周期 | Watch、快照、OVPack |
 | 运维与观测 | 系统、任务、Observer、Metrics |
 | 身份与治理 | 管理员、ACL、隐私配置 |
-| 协议与扩展 | OpenViking Assets、WebDAV、VikingBot API |
+| 协议与扩展 | OpenViking Assets、WebDAV、Agent Runtime API、VikingBot API |

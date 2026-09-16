@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -30,6 +31,7 @@ from openviking.service.task_tracker import get_task_tracker
 from openviking.service.task_work_index import bind_task_context
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
+from openviking.storage.errors import ResourceBusyError
 from openviking.storage.expr import And, Eq, Or, PathScope
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
@@ -294,25 +296,6 @@ class ReindexExecutor:
             return "user_namespace"
         if classification.is_user_namespace_root:
             return "user_namespace"
-        if parts[0] == "agent":
-            if len(parts) >= 2 and parts[1] in {"skills", "endpoints", "tools", "payments"}:
-                if classification.is_skill_namespace:
-                    return "skill_namespace"
-                if classification.is_skill_root:
-                    return "skill"
-                if classification.is_skill:
-                    raise OpenVikingError(
-                        f"Unsupported reindex URI: {uri}",
-                        code="UNSUPPORTED_URI",
-                        details={"uri": uri},
-                    )
-                return "resource"
-            raise OpenVikingError(
-                "viking://agent/{agent_id}/... is no longer supported; "
-                "use viking://agent/skills/... or viking://user/... instead.",
-                code="UNSUPPORTED_URI",
-                details={"uri": uri},
-            )
         if classification.is_memory:
             return "memory"
         if classification.is_skill_namespace:
@@ -325,7 +308,7 @@ class ReindexExecutor:
                 code="UNSUPPORTED_URI",
                 details={"uri": uri},
             )
-        if parts[0] in {"resources", "user"}:
+        if parts[0] in {"resources", "user"} or (parts[0] == "agent" and len(parts) >= 2):
             return "resource"
         raise OpenVikingError(
             f"Unsupported reindex URI: {uri}",
@@ -507,14 +490,25 @@ class ReindexExecutor:
         if telemetry_id:
             wait_tracker.register_request(telemetry_id)
 
-        acquire_lock = service.viking_fs._async_agfs.pathlock_acquire_tree
+        # prune_orphans only touches the vector store. A missing target has
+        # nothing on disk to protect, and acquiring a lock there would create
+        # the directory just to hold lock metadata. Refuse only when another
+        # owner is mid-write at that name (e.g. add_resource reserving it).
+        lease = None
         if mode != "prune_orphans" or await service.viking_fs.exists(uri, ctx=ctx):
+            acquire_lock = service.viking_fs._async_agfs.pathlock_acquire_tree
             stat = await service.viking_fs.stat(uri, ctx=ctx, skip_count=True)
             if not stat.get("isDir", stat.get("is_dir")):
                 acquire_lock = service.viking_fs._async_agfs.pathlock_acquire_exact
-        lease = await acquire_lock(path)
+            lease = await acquire_lock(path)
+        elif await service.viking_fs._async_agfs.pathlock_is_locked(path):
+            raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
         try:
-            borrowed = await service.viking_fs._async_agfs.pathlock_as_borrowed(lease)
+            borrowed = (
+                await service.viking_fs._async_agfs.pathlock_as_borrowed(lease)
+                if lease is not None
+                else None
+            )
             run = _ReindexRunContext(
                 ctx=ctx,
                 counters=counters,
@@ -576,7 +570,8 @@ class ReindexExecutor:
                     wait_tracker.build_queue_status(telemetry_id),
                 )
         finally:
-            await service.viking_fs._async_agfs.pathlock_release(lease)
+            if lease is not None:
+                await service.viking_fs._async_agfs.pathlock_release(lease)
             if telemetry_id:
                 wait_tracker.cleanup(telemetry_id)
 
@@ -846,9 +841,26 @@ class ReindexExecutor:
                 )
             return True
 
+        if self._is_hidden_meta_file(uri):
+            return False
+        exists = await self._prune_source_exists(uri, ctx=owner_ctx)
+        if exists.error:
+            self._record_prune_source_error(
+                counters=counters,
+                uri=uri,
+                source_uri=uri,
+                error=exists.error,
+            )
+            return False
+        # A real filename can have the same spelling as a virtual chunk URI.
+        if exists.exists:
+            return False
+
         if "#" in uri:
-            if context_type == ContextType.MEMORY.value and "#chunk_" in uri:
-                base_uri = uri.split("#chunk_", 1)[0]
+            # Generated chunks append a zero-padded index to the full base URI.
+            chunk_match = re.fullmatch(r"(.+)#chunk_[0-9]{4,}", uri)
+            if context_type == ContextType.MEMORY.value and chunk_match:
+                base_uri = chunk_match.group(1)
                 base = await self._read_prune_source(base_uri, ctx=owner_ctx)
                 if base.error:
                     self._record_prune_source_error(
@@ -866,18 +878,7 @@ class ReindexExecutor:
                 return uri not in expected
             return False
 
-        if self._is_hidden_meta_file(uri):
-            return False
-        exists = await self._prune_source_exists(uri, ctx=owner_ctx)
-        if exists.error:
-            self._record_prune_source_error(
-                counters=counters,
-                uri=uri,
-                source_uri=uri,
-                error=exists.error,
-            )
-            return False
-        return not exists.exists
+        return True
 
     async def _read_prune_source(self, uri: str, *, ctx: RequestContext) -> _PruneSourceRead:
         viking_fs = get_viking_fs()

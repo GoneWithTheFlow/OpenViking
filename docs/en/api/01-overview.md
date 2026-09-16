@@ -333,6 +333,8 @@ JSON output - error:
 | `SESSION_EXPIRED` | 410 | Session no longer exists |
 | `NOT_INITIALIZED` | - | Service or component not initialized (need to call initialize() first) |
 
+File/directory type misuse, copying or removing a directory without `recursive=true`, and a definitively nonexistent HTTP source hostname return `INVALID_ARGUMENT` (400). Path-lock contention, including encrypted writes, returns `CONFLICT` (409); corrupt lock tokens, lock I/O failures, and stored-data decryption failures return `INTERNAL` (500). An unavailable HTTP source or temporary network failure returns `UNAVAILABLE` (503), while a fetch timeout returns `DEADLINE_EXCEEDED` (504).
+
 ---
 
 ## API Endpoints
@@ -465,6 +467,7 @@ This catalog follows the routes actually mounted by the server. Each group headi
 
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/api/v1/compile` | Create an OV-owned Compile task |
 | GET | `/api/v1/tasks/{task_id}` | Get a background task |
 | POST | `/api/v1/tasks/{task_id}/cancel` | Cancel a background task |
 | GET | `/api/v1/tasks` | List background tasks |
@@ -485,6 +488,10 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | PUT | `/api/v1/admin/agent-evolution` | Update the caller account's Agent Evolution status |
 | GET | `/api/v1/admin/accounts/{account_id}/settings` | Get effective account settings |
 | PATCH | `/api/v1/admin/accounts/{account_id}/settings` | Update allowlisted account settings |
+| GET | `/api/v1/admin/accounts/{account_id}/memory-templates` | List editable memory templates, defaults and effective values |
+| GET | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | Read one memory template |
+| PUT | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | Complete and publish one memory template |
+| DELETE | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | Remove a memory template override and restore deployment defaults |
 | POST | `/api/v1/admin/accounts` | Create an account and its first administrator |
 | GET | `/api/v1/admin/accounts` | List accounts |
 | POST | `/api/v1/admin/migrate` | Migrate legacy identity data |
@@ -510,7 +517,7 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | POST | `/api/v1/privacy-configs/{category}/{target_key}` | Write and activate a new version |
 | POST | `/api/v1/privacy-configs/{category}/{target_key}/activate` | Activate a version |
 
-### [OpenViking Assets](22-openviking-assets.md), [WebDAV](20-webdav.md), and [VikingBot API](24-vikingbot.md)
+### [OpenViking Assets](22-openviking-assets.md), [WebDAV](20-webdav.md), [Agent Runtime API](23-agent-runtime.md), and [VikingBot API](24-vikingbot.md)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -523,13 +530,14 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | DELETE | `/webdav/resources`, `/webdav/resources/{resource_path}` | Delete a file or directory |
 | MKCOL | `/webdav/resources`, `/webdav/resources/{resource_path}` | Create a directory |
 | MOVE | `/webdav/resources`, `/webdav/resources/{resource_path}` | Move or rename a resource |
+| POST | `/api/v1/compile` | Create an asynchronous Compile task |
 | GET | `/bot/v1/health` | VikingBot health check |
 | POST | `/bot/v1/chat` | Non-streaming VikingBot chat |
 | POST | `/bot/v1/chat/stream` | Streaming VikingBot chat |
 | POST | `/bot/v1/feedback` | Submit feedback for a VikingBot answer |
-| POST | `/bot/v1/compile` | Start a Skill-driven Compile task |
-| GET | `/bot/v1/compile/{task_id}` | Get Compile task status |
-| POST | `/bot/v1/compile/{task_id}/cancel` | Cancel a Compile task |
+| POST | `/bot/v1/compile` | Retired; returns migration guidance for the new endpoint |
+| GET | `/bot/v1/compile/{task_id}` | Retired; returns Task API migration guidance |
+| POST | `/bot/v1/compile/{task_id}/cancel` | Retired; returns Task cancellation API migration guidance |
 
 ---
 
@@ -544,4 +552,4 @@ The sidebar is organized by responsibility rather than historical file size:
 | Data Lifecycle | Watches, snapshots, and OVPack |
 | Operations & Observability | System, tasks, Observer, and Metrics |
 | Identity & Governance | Administration, ACL, and privacy configuration |
-| Protocols & Extensions | OpenViking Assets, WebDAV, and VikingBot API |
+| Protocols & Extensions | OpenViking Assets, WebDAV, Agent Runtime API, and VikingBot API |

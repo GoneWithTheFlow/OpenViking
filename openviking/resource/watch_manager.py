@@ -362,9 +362,10 @@ class WatchManager:
             True if has permission, False otherwise
 
         Notes:
-            - ROOT can access all tasks.
-            - ADMIN can access tasks within the same account.
-            - USER can only access tasks they created within the same account.
+            - ROOT can access all tasks (system/scheduler bypass).
+            - Every other role (including ADMIN) is scoped to tasks they own
+              within the same account, so callers sharing an account but using
+              different user_ids never see each other's tasks.
         """
         role_value = (role or "").lower()
         if role_value == "root":
@@ -372,9 +373,6 @@ class WatchManager:
 
         if task.account_id != account_id:
             return False
-
-        if role_value == "admin":
-            return True
 
         return task.user_id == user_id
 
@@ -899,7 +897,12 @@ class WatchManager:
                     self._tasks.pop(task_id, None)
                     self._index_remove(task.account_id, task.to_uri, task_id)
 
-                    await self._save_tasks()
+                    try:
+                        await self._save_tasks()
+                    except Exception:
+                        self._tasks[task_id] = task
+                        self._index_add(task.account_id, task.to_uri, task_id)
+                        raise
                     logger.info(
                         f"[WatchManager] Deleted task {task_id} by user {account_id}/{user_id}"
                     )

@@ -27,7 +27,7 @@ from openviking.storage.abstract_overview import (
     plan_abstract_overview_refresh,
     render_abstract_overview,
 )
-from openviking.storage.acl import CreatorAclGrant
+from openviking.storage.acl import AclAction, AclMode, CreatorAclGrant
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.expr import And, Eq, In, Or
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
@@ -394,6 +394,11 @@ class FSService:
         memory_overview_uri = self._memory_overview_parent_uri(uri, context_type)
         result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
         await self._sync_watch_after_rm(uri, account_id=ctx.account_id, context_type=context_type)
+        # A refresh on a parent that no longer exists would lock its sidecar
+        # paths and thereby recreate the deleted directory. Nothing to
+        # summarize there; skip it.
+        if refresh_parent_uri and not await viking_fs.exists(refresh_parent_uri, ctx=ctx):
+            refresh_parent_uri = None
         queue_status = None
         refresh_action: Optional[FreshnessAction] = None
         request_registered = False
@@ -928,10 +933,26 @@ class FSService:
             result, ctx, None, include_tags or "tags" in (extra_fields or [])
         )
 
-    async def stat(self, uri: str, ctx: RequestContext, skip_count: bool = False) -> Dict[str, Any]:
+    async def stat(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        skip_count: bool = False,
+        include_lock_status: bool = False,
+    ) -> Dict[str, Any]:
         """Get resource status."""
         viking_fs = self._ensure_initialized()
-        return await viking_fs.stat(uri, ctx=ctx, skip_count=skip_count)
+        return await viking_fs.stat(
+            uri,
+            ctx=ctx,
+            skip_count=skip_count,
+            include_lock_status=include_lock_status,
+        )
+
+    async def ensure_write_access(self, uri: str, ctx: RequestContext) -> None:
+        """Validate write access without mutating the target."""
+        viking_fs = self._ensure_initialized()
+        await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
 
     async def system_sync_status(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
         """Return multi-write sync status for one Viking URI subtree."""
@@ -1048,15 +1069,21 @@ class FSService:
         viking_fs = self._ensure_initialized()
         normalized_tags = normalize_search_tags(tags, discard_invalid=True)
         project_tags = bool(normalized_tags) or include_tags
+        tag_filter = None
+        if normalized_tags:
+            from openviking.utils.tags import build_search_tags_filter
+
+            tag_filter = build_search_tags_filter(normalized_tags)
         result = dict(
             await viking_fs.glob(
                 pattern,
                 uri=uri,
-                node_limit=None if normalized_tags else node_limit,
+                node_limit=node_limit,
                 ctx=ctx,
                 extra_fields=extra_fields
                 if extra_fields is not None
                 else ([] if project_tags else None),
+                tag_filter=tag_filter,
             )
         )
         if not project_tags:
@@ -1146,9 +1173,13 @@ class FSService:
         return await self._ensure_initialized().get_acl(uri, ctx=ctx)
 
     async def set_acl(
-        self, uri: str, entries: List[Dict[str, str]], ctx: RequestContext
+        self,
+        uri: str,
+        entries: Optional[List[Dict[str, str]]],
+        ctx: RequestContext,
+        acl_mode: Optional[AclMode] = None,
     ) -> Dict[str, Any]:
-        return await self._ensure_initialized().set_acl(uri, entries, ctx=ctx)
+        return await self._ensure_initialized().set_acl(uri, entries, ctx=ctx, acl_mode=acl_mode)
 
     async def grant_acl(
         self, uri: str, principal: str, level: str, ctx: RequestContext

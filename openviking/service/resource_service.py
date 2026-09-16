@@ -282,6 +282,7 @@ class ResourceService:
         for key, value in processor_kwargs.items():
             if key in {
                 "auth_config",
+                "lark_file",
                 FEISHU_ACCESS_TOKEN_ARG,
                 FEISHU_REFRESH_TOKEN_ARG,
                 "parser_backend",
@@ -709,10 +710,13 @@ class ResourceService:
             parent_uri = None
             queued_args = dict(msg.args)
             legacy_backend = normalize_parser_backend(queued_args.pop("parser_backend", None))
+            feishu_prepared = queued_args.pop("_feishu_prepared_source", False)
             parser_backend = legacy_backend or (
                 ParserBackend.UNDERSTANDING
                 if msg.understanding_response_id is not None
                 or msg.understanding_file_id is not None
+                else None
+                if feishu_prepared
                 else ParserBackend.INTERNAL
             )
             internal_kwargs: Dict[str, Any] = {"parser_backend": parser_backend}
@@ -744,6 +748,20 @@ class ResourceService:
                 task_auth or {},
             )
             internal_kwargs.update(auth_kwargs)
+            if feishu_prepared:
+                from openviking.service.task_tracker import get_task_tracker
+
+                tracker = get_task_tracker()
+                task = await tracker.get(msg.task_id, ctx.account_id, ctx.user.user_id)
+                saved = dict(task.meta.get("feishu_responses", {})) if task else {}
+
+                async def save_response(entry: str, response_id: str) -> None:
+                    await tracker.record_feishu_response(
+                        msg.task_id, entry, response_id, ctx.account_id, ctx.user.user_id
+                    )
+                    saved[entry] = response_id
+
+                internal_kwargs["_feishu_checkpoint"] = (saved, save_response)
             prepared_resource = None
             if msg.staged_source is not None:
                 prepared_resource = await materialize_source(
@@ -934,6 +952,11 @@ class ResourceService:
             source_name = source_name or source_info.source_name
             source_info.source_name = source_name
         elif feishu_source:
+            from openviking.parse.feishu_import import recursive_wiki
+
+            recursive = FeishuAccessor._parse_feishu_url(path)[0] == "wiki" and recursive_wiki(
+                processor_kwargs
+            )
             token = processor_kwargs.get(FEISHU_ACCESS_TOKEN_ARG)
             if isinstance(token, str) and token.strip():
                 task_auth = dict(
@@ -946,6 +969,7 @@ class ResourceService:
             preflight = await FeishuAccessor().preflight_source(
                 path,
                 feishu_access_token=token.strip() if isinstance(token, str) else None,
+                **({"feishu_recursive": True} if recursive else {}),
             )
             source_name = source_name or preflight.source_name
             source_info = _ResourceSourceInfo(
@@ -968,6 +992,18 @@ class ResourceService:
                 )
                 if watch_auth_state is None:
                     task_auth = {}
+            else:
+                source_type, _ = FeishuAccessor._parse_feishu_url(path)
+                if source_type in {"folder", "file"} or recursive:
+                    if processor_kwargs.get("lark_file") is not None:
+                        raise InvalidArgumentError(
+                            "Feishu sources requiring preparation use args.feishu_access_token "
+                            "or configured Feishu application credentials; args.lark_file "
+                            "is only supported for direct single-document Understanding imports."
+                        )
+                    # These sources choose a content backend after source preparation.
+                    queued_args["parser_backend"] = processor_kwargs.get("parser_backend")
+                    queued_args["_feishu_prepared_source"] = True
         else:
             prepared = await self._resource_processor.prepare_durable_source(
                 path,
@@ -1515,7 +1551,7 @@ class ResourceService:
                 or the imported ``root_uri``. Nonpositive values create no Watch:
                 native imports with explicit ``to`` pause a single accessible Watch
                 (ConflictError if ambiguous); Connector imports leave Watches untouched.
-            is_active: When false, the Connector or native Feishu Watch is created paused.
+            is_active: When false, the Connector, native Feishu, or native Git Watch is created paused.
                 Requires watch_interval > 0 and an explicit to or parent target.
             enforce_public_remote_targets: When True, reject non-public remote hosts and
                 validate each outbound HTTP request URL during fetch.
@@ -1751,9 +1787,11 @@ class ResourceService:
 
         from openviking.parse.accessors.feishu_accessor import FeishuAccessor
 
-        if is_active is False and not FeishuAccessor._is_feishu_url(path):
+        if is_active is False and not (
+            FeishuAccessor._is_feishu_url(path) or is_git_repo_url(path)
+        ):
             raise InvalidArgumentError(
-                "is_active=false is only supported for Connector or native Feishu imports."
+                "is_active=false is only supported for Connector, native Feishu, or native Git imports."
             )
         if enforce_public_remote_targets and is_remote_resource_source(path):
             path = require_remote_resource_source(path)
@@ -1834,7 +1872,9 @@ class ResourceService:
                 timeout=timeout,
             )
         except TimeoutError as exc:
-            raise DeadlineExceededError("add resource task", timeout) from exc
+            raise DeadlineExceededError(
+                "waiting for resource import", timeout, task_id=task_id
+            ) from exc
 
         if task.status == TaskStatus.COMPLETED:
             completed = dict(task.result)
